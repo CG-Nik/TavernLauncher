@@ -653,6 +653,9 @@ class ServerLauncher(tk.Tk):
         self._set_running(True)
         self._print(f"Server running (PID {self._proc.pid})", "ok")
         threading.Thread(target=self._watch, daemon=True).start()
+        # Kill a still-pending reboot timer from before this start
+        if getattr(self, "_reboot_after_id", None):
+            self.after_cancel(self._reboot_after_id)
         self._reboot_after_id = None
         self._schedule_auto_reboot()
 
@@ -665,6 +668,10 @@ class ServerLauncher(tk.Tk):
             self.after(0, lambda: self._set_running(False))
 
     def _stop(self, reboot=False):
+        # A manual stop
+        if getattr(self, "_reboot_after_id", None):
+            self.after_cancel(self._reboot_after_id)
+            self._reboot_after_id = None
         if self._proc:
             try: self._proc.terminate(); self._print("Closing server…", "warn")
             except Exception as e: self._print(f"Stop failed: {e}", "err")
