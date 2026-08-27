@@ -32,6 +32,7 @@ from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
 from tavern_shared.patch import _patch_source_path, _patch_is_applied, apply_patch
 from tavern_shared.mods_window import ModsWindow
+from tavern_shared.log_archive import archive_log_now, should_auto_archive
 
 from client.core.config import (
     load_cfg, save_cfg, CONFIG_FILE, GAME_LOG_PATH, COMMUNITY_API, DISCORD_URL,
@@ -207,7 +208,13 @@ class ClientLauncher(tk.Tk):
         self._action_btn.pack(side="left", fill="x", expand=True, padx=(4,0))
 
         # ── Log ───────────────────────────────────────────────────────────────
-        _section_label(self, "GAME LOG")
+        log_header = tk.Frame(self, bg=BG)
+        log_header.pack(fill="x")
+        tk.Label(log_header, text="GAME LOG", bg=BG, fg=MUTED,
+                 font=("Georgia",8,"bold")).pack(side="left", padx=22, pady=(7,3))
+        self._archive_log_btn = _btn(log_header, "🗄 Archive Log", self._on_archive_log_click,
+             font=("Segoe UI",7), pady=2, padx=6)
+        self._archive_log_btn.pack(side="right", padx=(0,20))
         lf = tk.Frame(self, bg=BG)
         lf.pack(fill="both", expand=True, padx=20, pady=(0,8))
         lb = tk.Frame(lf, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
@@ -538,6 +545,7 @@ class ClientLauncher(tk.Tk):
         self.v_show_melonloader.set(cfg.get("show_melonloader", False))
         self._print("Ready. Enter a server IP, then Check Server (optional) or Join Server.", "dim")
         self._start_log_tailer()
+        self._start_auto_archive_check()
         if _any_token_files_exist():
             self._show_token_button()
         # Immediate check at startup — the trace-driven debounce from
@@ -718,6 +726,46 @@ class ClientLauncher(tk.Tk):
         self._tailer = GameLogTailer(GAME_LOG_PATH, on_line)
         self._tailer.start()
 
+    def _archive_log_with_tailer_paused(self, on_done):
+        # The log tailer keeps its own read handle open, which blocks
+        # renaming the file -- pause it, archive, then restart it.
+        def worker():
+            self._tailer.stop_and_wait(timeout=2)
+            ok, result, locked = archive_log_now(GAME_LOG_PATH)
+            self.after(0, self._start_log_tailer)
+            self.after(0, lambda: on_done(ok, result, locked))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_archive_log_click(self):
+        def after_pausing_tailer(ok, result, locked):
+            if ok:
+                self._print(f"Log archived to {result}", "ok")
+            elif locked:
+                # Still locked with our own tailer paused -- the game
+                # itself has it open. Can't force-close a player's
+                # session to fix this, so just say what's needed.
+                self._print(
+                    "Couldn't archive the log — the game currently has it open. "
+                    "Close the game first, then try again.", "err")
+            else:
+                self._print(f"Couldn't archive log: {result}", "err")
+        self._archive_log_with_tailer_paused(after_pausing_tailer)
+
+    def _start_auto_archive_check(self):
+        # Backup for the game's own size-based archiving. Only archives
+        # when it can do so without needing the game closed.
+        try:
+            if should_auto_archive(GAME_LOG_PATH):
+                def after_pausing_tailer(ok, result, locked):
+                    if ok:
+                        self._print(f"Log passed the size threshold — auto-archived to {result}", "warn")
+                    elif not locked:
+                        self._print(f"Log passed the size threshold, but auto-archive failed: {result}", "err")
+                self._archive_log_with_tailer_paused(after_pausing_tailer)
+        except Exception:
+            pass
+        self.after(60000, self._start_auto_archive_check)
+
     def _append_log(self, line, tag):
         self.log.config(state="normal")
         self.log.insert("end", line+"\n", tag)
@@ -736,6 +784,15 @@ class ClientLauncher(tk.Tk):
         return {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 
     def _on_join_clicked(self):
+        # Archive the previous log before joining.
+        self._action_btn.config(state="disabled")
+        self._archive_log_with_tailer_paused(self._on_pre_join_archive_done)
+
+    def _on_pre_join_archive_done(self, ok, result, locked):
+        if ok:
+            self._print(f"Log archived to {result}", "ok")
+        elif not locked and result != "No active log file found to archive.":
+            self._print(f"Couldn't archive previous log: {result}", "err")
         if self._selected_kind == "headless":
             self._do_launch_headless()
         else:

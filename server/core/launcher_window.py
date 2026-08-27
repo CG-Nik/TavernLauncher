@@ -29,6 +29,7 @@ from tavern_shared.log_tailer import GameLogTailer
 from tavern_shared.mod_install import _melonloader_installed, _mods_need_attention
 from tavern_shared.patch import _patch_source_path, _patch_is_applied, apply_patch
 from tavern_shared.mods_window import ModsWindow
+from tavern_shared.log_archive import archive_log_now, should_auto_archive
 
 from server.core.data_store import (
     load_cfg, save_cfg, CONFIG_FILE, GAME_LOG_PATH, DISCORD_URL,
@@ -89,6 +90,7 @@ class ServerLauncher(tk.Tk):
         self._build_ui()
         self._load()
         self._start_log_tailer()
+        self._start_auto_archive_check()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Same reasoning as the client launcher — fit_w used to be a
         # hardcoded guess that went stale every time a row gained another
@@ -175,7 +177,13 @@ class ServerLauncher(tk.Tk):
                               font=("Georgia",12,"bold"), pady=12)
         self._btn_stop.pack(fill="x")
         self._btn_stop.config(state="disabled")
-        _section_label(self, "SERVER LOG")
+        log_header = tk.Frame(self, bg=BG)
+        log_header.pack(fill="x")
+        tk.Label(log_header, text="SERVER LOG", bg=BG, fg=MUTED,
+                 font=("Georgia",8,"bold")).pack(side="left", padx=22, pady=(7,3))
+        self._archive_log_btn = _btn(log_header, "🗄 Archive Log", self._on_archive_log_click,
+             font=("Segoe UI",7), pady=2, padx=6)
+        self._archive_log_btn.pack(side="right", padx=(0,20))
         lf = tk.Frame(self, bg=BG)
         lf.pack(fill="both", expand=True, padx=20, pady=(0,8))
         lb = tk.Frame(lf, bg=SURF, highlightbackground=BORDER, highlightthickness=1)
@@ -604,6 +612,81 @@ class ServerLauncher(tk.Tk):
         self._tailer = GameLogTailer(GAME_LOG_PATH, on_line)
         self._tailer.start()
 
+    def _archive_log_with_tailer_paused(self, on_done):
+        # The log tailer keeps its own read handle open, which blocks
+        # renaming the file -- pause it, archive, then restart it.
+        def worker():
+            self._tailer.stop_and_wait(timeout=2)
+            ok, result, locked = archive_log_now(GAME_LOG_PATH)
+            self.after(0, self._start_log_tailer)
+            self.after(0, lambda: on_done(ok, result, locked))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_archive_log_click(self):
+        def after_pausing_tailer(ok, result, locked):
+            if ok:
+                self._print(f"Log archived to {result}", "ok")
+                return
+            if not locked:
+                self._print(f"Couldn't archive log: {result}", "err")
+                return
+
+            # Still locked with our own tailer paused -- the game itself
+            # has it open, which only happens if the server's running.
+            server_running = self._proc is not None and self._proc.poll() is None
+            if not server_running:
+                self._print(f"Couldn't archive log: {result}", "err")
+                return
+
+            if not messagebox.askyesno("Archive Log",
+                    "The server is running and has the log file open, so it "
+                    "needs to briefly stop and restart to archive it. "
+                    "Connected players will be disconnected and can rejoin "
+                    "once it's back.\n\nContinue?", parent=self):
+                return
+
+            self._print("Archive Log: stopping the server to free the log file…", "warn")
+
+            def do_archive_then_restart():
+                ok2, result2, _locked2 = archive_log_now(GAME_LOG_PATH)
+                if ok2:
+                    self._print(f"Log archived to {result2}", "ok")
+                else:
+                    self._print(f"Couldn't archive log even after stopping the server: {result2}", "err")
+                self._start()
+
+            # _stop() clears self._proc right away, so grab it first.
+            proc_to_wait = self._proc
+            self._stop(reboot=False)
+
+            def wait_for_exit_then_archive():
+                if proc_to_wait is not None:
+                    try:
+                        proc_to_wait.wait(timeout=5)
+                    except Exception:
+                        pass
+                self.after(500, do_archive_then_restart)
+            threading.Thread(target=wait_for_exit_then_archive, daemon=True).start()
+
+        self._archive_log_with_tailer_paused(after_pausing_tailer)
+
+    def _start_auto_archive_check(self):
+        # Backup for the game's own size-based archiving, which doesn't
+        # always seem to fire reliably on a long-running server. Never
+        # restarts the server on its own -- only archives when it can do
+        # so without kicking anyone; the manual button covers the rest.
+        try:
+            if should_auto_archive(GAME_LOG_PATH):
+                def after_pausing_tailer(ok, result, locked):
+                    if ok:
+                        self._print(f"Log passed the size threshold — auto-archived to {result}", "warn")
+                    elif not locked:
+                        self._print(f"Log passed the size threshold, but auto-archive failed: {result}", "err")
+                self._archive_log_with_tailer_paused(after_pausing_tailer)
+        except Exception:
+            pass
+        self.after(60000, self._start_auto_archive_check)
+
     def _append_log(self, line, tag):
         self.log.config(state="normal")
         self.log.insert("end", line+"\n", tag)
@@ -617,6 +700,19 @@ class ServerLauncher(tk.Tk):
             messagebox.showerror("Not found",
                 "Could not find the game.\nPlease browse first.", parent=self)
             return
+        # Archive the previous log before starting -- also covers auto-reboot,
+        # since that calls _start() too.
+        self._archive_log_with_tailer_paused(
+            lambda ok, result, locked: self._on_pre_start_archive_done(ok, result, locked, exe))
+
+    def _on_pre_start_archive_done(self, ok, result, locked, exe):
+        if ok:
+            self._print(f"Log archived to {result}", "ok")
+        elif not locked and result != "No active log file found to archive.":
+            self._print(f"Couldn't archive previous log: {result}", "err")
+        self._start_after_archive(exe)
+
+    def _start_after_archive(self, exe):
         try: port = int(self.v_port.get())
         except: port = 1757
         self._save()
