@@ -158,6 +158,14 @@ def load_server_settings():
         hostname = ""
     ss["public_hostname"] = hostname
 
+    try:
+        gc_timer = float(ss.get("garbage_collection_timer", 30))
+        if gc_timer <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        gc_timer = 30.0
+    ss["garbage_collection_timer"] = gc_timer
+
     return ss
 
 
