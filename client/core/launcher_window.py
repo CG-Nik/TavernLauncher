@@ -23,6 +23,7 @@ from tavern_shared.theme import (
     _btn, _field, _hint, _section_label, _divider, _mk_combobox, _mk_scrollbar,
 )
 from tavern_shared.window_chrome import _start_hidden, _finish_dark_window, _set_window_icon, _header_crop_box
+from tavern_shared.help_pane import attach_help_tab
 from tavern_shared.assets import _HEADER_BANNER_IMG
 try:
     from PIL import Image as _PILImage, ImageTk as _PILImageTk, ImageEnhance as _PILImageEnhance
@@ -113,6 +114,7 @@ class ClientLauncher(tk.Tk):
         self.geometry(f"{fit_w}x{fit_h}")
         self.minsize(fit_w, fit_h)
         _finish_dark_window(self)
+        attach_help_tab(self)
 
     # ── UI ─────────────────────────────────────────────────────────────────────
 
